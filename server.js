@@ -1,136 +1,92 @@
 import express from 'express';
-import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
 
 const app = express();
-
 app.use(express.json());
 
+// ---- Simple JSON Database ----
+const DB_FILE = path.join(process.cwd(), 'db.json');
+
+function readDB() {
+  if (!fs.existsSync(DB_FILE)) {
+    fs.writeFileSync(DB_FILE, JSON.stringify({ clients: [] }, null, 2));
+  }
+  return JSON.parse(fs.readFileSync(DB_FILE));
+}
+
+function writeDB(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+// ---- Health check ----
 app.get('/', (req, res) => {
-  return res.status(200).send({'message': 'SHIPTIVITY API. Read documentation to see API docs'});
+  res.status(200).send({
+    message: 'SHIPTIVITY API running (JSON DB)',
+  });
 });
 
-// We are keeping one connection alive for the rest of the life application for simplicity
-const db = new Database('./clients.db');
-
-// Don't forget to close connection when server gets terminated
-const closeDb = () => db.close();
-process.on('SIGTERM', closeDb);
-process.on('SIGINT', closeDb);
-
-/**
- * Validate id input
- * @param {any} id
- */
-const validateId = (id) => {
-  if (Number.isNaN(id)) {
-    return {
-      valid: false,
-      messageObj: {
-      'message': 'Invalid id provided.',
-      'long_message': 'Id can only be integer.',
-      },
-    };
-  }
-  const client = db.prepare('select * from clients where id = ? limit 1').get(id);
-  if (!client) {
-    return {
-      valid: false,
-      messageObj: {
-      'message': 'Invalid id provided.',
-      'long_message': 'Cannot find client with that id.',
-      },
-    };
-  }
-  return {
-    valid: true,
-  };
-}
-
-/**
- * Validate priority input
- * @param {any} priority
- */
-const validatePriority = (priority) => {
-  if (Number.isNaN(priority)) {
-    return {
-      valid: false,
-      messageObj: {
-      'message': 'Invalid priority provided.',
-      'long_message': 'Priority can only be positive integer.',
-      },
-    };
-  }
-  return {
-    valid: true,
-  }
-}
-
-/**
- * Get all of the clients. Optional filter 'status'
- * GET /api/v1/clients?status={status} - list all clients, optional parameter status: 'backlog' | 'in-progress' | 'complete'
- */
+// ---- Get all clients (optional status filter) ----
 app.get('/api/v1/clients', (req, res) => {
-  const status = req.query.status;
+  const { status } = req.query;
+  const db = readDB();
+
+  let clients = db.clients;
+
   if (status) {
-    // status can only be either 'backlog' | 'in-progress' | 'complete'
-    if (status !== 'backlog' && status !== 'in-progress' && status !== 'complete') {
-      return res.status(400).send({
-        'message': 'Invalid status provided.',
-        'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
-      });
-    }
-    const clients = db.prepare('select * from clients where status = ?').all(status);
-    return res.status(200).send(clients);
+    clients = clients.filter(c => c.status === status);
   }
-  const statement = db.prepare('select * from clients');
-  const clients = statement.all();
-  return res.status(200).send(clients);
+
+  // sort by priority (top → bottom)
+  clients.sort((a, b) => a.priority - b.priority);
+
+  res.status(200).send(clients);
 });
 
-/**
- * Get a client based on the id provided.
- * GET /api/v1/clients/{client_id} - get client by id
- */
-app.get('/api/v1/clients/:id', (req, res) => {
-  const id = parseInt(req.params.id , 10);
-  const { valid, messageObj } = validateId(id);
-  if (!valid) {
-    res.status(400).send(messageObj);
-  }
-  return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
-});
-
-/**
- * Update client information based on the parameters provided.
- * When status is provided, the client status will be changed
- * When priority is provided, the client priority will be changed with the rest of the clients accordingly
- * Note that priority = 1 means it has the highest priority (should be on top of the swimlane).
- * No client on the same status should not have the same priority.
- * This API should return list of clients on success
- *
- * PUT /api/v1/clients/{client_id} - change the status of a client
- *    Data:
- *      status (optional): 'backlog' | 'in-progress' | 'complete',
- *      priority (optional): integer,
- *
- */
+// ---- Update client (status OR priority) ----
 app.put('/api/v1/clients/:id', (req, res) => {
-  const id = parseInt(req.params.id , 10);
-  const { valid, messageObj } = validateId(id);
-  if (!valid) {
-    res.status(400).send(messageObj);
+  const id = parseInt(req.params.id, 10);
+  const { status, priority } = req.body;
+
+  const db = readDB();
+  const clients = db.clients;
+
+  let client = clients.find(c => c.id === id);
+
+  // if client does not exist, create it
+  if (!client) {
+    client = {
+      id,
+      status: status || 'backlog',
+      priority: priority || clients.length + 1,
+    };
+    clients.push(client);
   }
 
-  let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
+  // update status
+  if (status) {
+    client.status = status;
+  }
 
-  /* ---------- Update code below ----------*/
+  // update priority (reorder swimlane)
+  if (priority) {
+    const sameLane = clients.filter(c => c.status === client.status && c.id !== id);
 
+    sameLane.sort((a, b) => a.priority - b.priority);
 
+    sameLane.splice(priority - 1, 0, client);
 
-  return res.status(200).send(clients);
+    sameLane.forEach((c, index) => {
+      c.priority = index + 1;
+    });
+  }
+
+  writeDB({ clients });
+
+  res.status(200).send(clients);
 });
 
-app.listen(3001);
-console.log('app running on port ', 3001);
+// ---- Start server ----
+app.listen(3001, () => {
+  console.log('🚀 Shiptivity backend running on port 3001');
+});
